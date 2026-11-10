@@ -19,6 +19,119 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
+const PLATFORM_FEE_BPS = 1200; // 12% of the accepted quote, in basis points.
+const TEST_PAYMENTS_ONLY = process.env.STRIPE_PAYMENTS_ENABLED === "true" &&
+  Boolean(process.env.STRIPE_SECRET_KEY && /^(sk|rk)_test_/.test(process.env.STRIPE_SECRET_KEY));
+
+function moneyToCents(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error("Invalid payment amount");
+  return Math.round((amount + Number.EPSILON) * 100);
+}
+
+function centsToMoney(value) {
+  return (Number(value) / 100).toFixed(2);
+}
+
+function paymentFeatureUnavailable(res) {
+  return res.status(503).json({
+    error: "HandyGo payments are disabled. Only an explicitly enabled Stripe test-mode environment can use this unfinished integration."
+  });
+}
+
+async function getAcceptedQuote(jobId) {
+  const { data, error } = await supabase.from("quotes").select("*")
+    .eq("job_id", jobId).eq("status", "accepted").order("created_at", { ascending: false })
+    .limit(1).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function releaseProviderTransfer(jobId) {
+  if (!stripe) throw new Error("Stripe is not configured");
+  const { data: job, error: jobError } = await supabase.from("jobs").select("*").eq("id", jobId).maybeSingle();
+  if (jobError) throw jobError;
+  if (!job || job.status !== "completed" ||
+      !job.customer_completed_at || !job.handyman_completed_at) {
+    return { transferred: false, reason: "Both customer and provider completion confirmations are required" };
+  }
+
+  const { data: payment, error: paymentError } = await supabase.from("payments").select("*")
+    .eq("job_id", jobId).eq("status", "succeeded").maybeSingle();
+  if (paymentError) throw paymentError;
+  if (!payment) return { transferred: false, reason: "A successful customer payment is required" };
+  if (payment.stripe_transfer_id || payment.transfer_status === "transferred") {
+    return { transferred: true, transfer_id: payment.stripe_transfer_id };
+  }
+
+  const quote = await getAcceptedQuote(jobId);
+  if (!quote || quote.handyman_id !== payment.handyman_id) {
+    throw new Error("Accepted quote and payment provider do not match");
+  }
+
+  const { data: profile, error: profileError } = await supabase.from("handyman_profiles")
+    .select("stripe_connected_account_id").eq("user_id", payment.handyman_id).maybeSingle();
+  if (profileError) throw profileError;
+  const accountId = profile?.stripe_connected_account_id;
+  if (!accountId) return { transferred: false, reason: "Provider has not completed Stripe onboarding" };
+
+  // Accounts v2 capability state is checked immediately before every transfer.
+  const account = await stripe.v2.core.accounts.retrieve(accountId);
+  const transferCapabilityStatus =
+    account?.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers?.status;
+  if (transferCapabilityStatus !== "active") {
+    return { transferred: false, reason: "Provider transfer capability is not active" };
+  }
+
+  let chargeId = payment.stripe_charge_id;
+  if (!chargeId && payment.stripe_payment_intent_id) {
+    const intent = await stripe.paymentIntents.retrieve(payment.stripe_payment_intent_id);
+    chargeId = typeof intent.latest_charge === "string"
+      ? intent.latest_charge
+      : intent.latest_charge?.id;
+  }
+  if (!chargeId) return { transferred: false, reason: "The successful charge is not yet available" };
+
+  const transferAmount = moneyToCents(payment.provider_amount);
+  if (transferAmount <= 0) throw new Error("Provider transfer amount must be positive");
+  const transferGroup = payment.transfer_group || `handygo_job_${jobId}`;
+
+  // Stripe idempotency prevents duplicate transfers if completion requests race or retry.
+  const transfer = await stripe.transfers.create({
+    amount: transferAmount,
+    currency: String(payment.currency_code || "USD").toLowerCase(),
+    destination: accountId,
+    source_transaction: chargeId,
+    transfer_group: transferGroup,
+    metadata: { handygo_job_id: jobId, handygo_payment_id: payment.id }
+  }, { idempotencyKey: `handygo:job:${jobId}:provider-transfer:v1` });
+
+  const { error: updateError } = await supabase.from("payments").update({
+    stripe_transfer_id: transfer.id,
+    transfer_group: transferGroup,
+    transfer_status: "transferred",
+    updated_at: new Date().toISOString()
+  }).eq("id", payment.id);
+  if (updateError) throw updateError;
+  return { transferred: true, transfer_id: transfer.id };
+}
+
+async function reverseProviderTransfer(payment, targetReversedCents, idempotencyKey) {
+  if (!payment.stripe_transfer_id || !stripe) return;
+  const transfer = await stripe.transfers.retrieve(payment.stripe_transfer_id);
+  const alreadyReversed = Number(transfer.amount_reversed || 0);
+  const target = Math.min(Number(transfer.amount), Math.max(0, targetReversedCents));
+  const delta = target - alreadyReversed;
+  if (delta <= 0) return;
+  await stripe.transfers.createReversal(transfer.id, { amount: delta }, { idempotencyKey });
+  const nextStatus = target >= Number(transfer.amount) ? "reversed" : "partially_reversed";
+  const { error } = await supabase.from("payments").update({
+    transfer_status: nextStatus,
+    updated_at: new Date().toISOString()
+  }).eq("id", payment.id);
+  if (error) throw error;
+}
+
 app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors({ origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN.split(",").map(s => s.trim()) }));
@@ -210,14 +323,99 @@ app.post("/quotes/:id/accept", auth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-app.post("/payments/create-intent", auth, (_req, res) => {
-  // Fail closed until server-verified job pricing and delayed Connect transfers are implemented.
-  res.status(503).json({ error: "Payments are temporarily disabled pending completion of the delayed-transfer payment flow." });
+app.post("/payments/create-intent", auth, async (req, res, next) => {
+  if (!TEST_PAYMENTS_ONLY || !stripe) return paymentFeatureUnavailable(res);
+  try {
+    const { job_id } = req.body || {};
+    if (typeof job_id !== "string" || !job_id) return res.status(400).json({ error: "job_id is required" });
+
+    const { data: job, error: jobError } = await supabase.from("jobs").select("*").eq("id", job_id).maybeSingle();
+    if (jobError) return next(jobError);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    if (job.customer_id !== req.user.id) return res.status(403).json({ error: "Only the job customer can pay" });
+    if (job.status !== "booked") return res.status(409).json({ error: "Only booked jobs can be paid" });
+
+    const quote = await getAcceptedQuote(job_id);
+    if (!quote) return res.status(409).json({ error: "An accepted quote is required before payment" });
+    if (String(quote.currency_code || job.currency_code || "USD").toUpperCase() !== "USD") {
+      return res.status(400).json({ error: "This test implementation currently supports USD payments only" });
+    }
+
+    const grossCents = moneyToCents(quote.amount);
+    const platformFeeCents = Math.round(grossCents * PLATFORM_FEE_BPS / 10000);
+    const providerCents = grossCents - platformFeeCents;
+    if (providerCents <= 0) return res.status(400).json({ error: "Quote is too small for the configured platform fee" });
+
+    const { data: existing, error: existingError } = await supabase.from("payments").select("*")
+      .eq("job_id", job_id).in("status", ["pending", "authorized", "succeeded", "partially_refunded", "disputed"])
+      .maybeSingle();
+    if (existingError) return next(existingError);
+    if (existing?.stripe_payment_intent_id) {
+      const existingIntent = await stripe.paymentIntents.retrieve(existing.stripe_payment_intent_id);
+      if (existingIntent.status === "succeeded") {
+        return res.status(409).json({ error: "This job has already been paid" });
+      }
+      return res.json({
+        payment_intent_id: existingIntent.id,
+        client_secret: existingIntent.client_secret,
+        amount: existing.amount,
+        currency: existing.currency_code,
+        status: existingIntent.status
+      });
+    }
+
+    const transferGroup = `handygo_job_${job_id}`;
+    const idempotencyKey = `handygo:job:${job_id}:payment-intent:v1`;
+    const intent = await stripe.paymentIntents.create({
+      amount: grossCents,
+      currency: "usd",
+      automatic_payment_methods: { enabled: true },
+      transfer_group: transferGroup,
+      metadata: {
+        handygo_job_id: job_id,
+        handygo_customer_id: req.user.id,
+        handygo_provider_id: quote.handyman_id,
+        handygo_quote_id: quote.id,
+        handygo_platform_fee_cents: String(platformFeeCents),
+        handygo_provider_amount_cents: String(providerCents)
+      }
+    }, { idempotencyKey });
+
+    const { data: payment, error: insertError } = await supabase.from("payments").insert({
+      job_id,
+      customer_id: req.user.id,
+      handyman_id: quote.handyman_id,
+      stripe_payment_intent_id: intent.id,
+      amount: centsToMoney(grossCents),
+      currency_code: "USD",
+      platform_fee: centsToMoney(platformFeeCents),
+      provider_amount: centsToMoney(providerCents),
+      status: "pending",
+      transfer_group: transferGroup,
+      transfer_status: "pending"
+    }).select("id").single();
+
+    if (insertError) {
+      // A retry uses the same Stripe idempotency key; never create a second charge.
+      return next(insertError);
+    }
+    res.status(201).json({
+      payment_id: payment.id,
+      payment_intent_id: intent.id,
+      client_secret: intent.client_secret,
+      amount: centsToMoney(grossCents),
+      currency: "USD",
+      platform_fee: centsToMoney(platformFeeCents),
+      provider_amount: centsToMoney(providerCents),
+      status: intent.status
+    });
+  } catch (err) { next(err); }
 });
 
 app.post("/connect/onboarding", auth, (_req, res) => {
-  // Do not accept client-supplied connected-account IDs for onboarding.
-  res.status(503).json({ error: "Provider onboarding is temporarily disabled pending server-managed Stripe Connect accounts." });
+  // Connected-account creation is deliberately disabled until adult-authorized business verification
+  // and the Accounts v2 onboarding flow are completed and reviewed.
+  res.status(503).json({ error: "Provider onboarding is not enabled. Complete authorized business verification before enabling Connect." });
 });
 
 app.post("/notifications/register-token", auth, async (req, res, next) => {
@@ -243,6 +441,32 @@ app.post("/reports", auth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+app.post("/jobs/:id/complete", auth, async (req, res, next) => {
+  try {
+    const { data: payment, error: paymentError } = await supabase.from("payments").select("id,status")
+      .eq("job_id", req.params.id).maybeSingle();
+    if (paymentError) return next(paymentError);
+    if (!payment || payment.status !== "succeeded") {
+      return res.status(409).json({ error: "A successful customer payment is required before completion confirmation" });
+    }
+
+    const { data: job, error } = await supabase.rpc("confirm_job_completion", {
+      p_job_id: req.params.id,
+      p_actor_id: req.user.id
+    });
+    if (error) return next(error);
+    if (job.status !== "completed") {
+      return res.json({ job, transfer: { transferred: false, reason: "Waiting for the other participant to confirm completion" } });
+    }
+
+    if (!TEST_PAYMENTS_ONLY || !stripe) {
+      return res.json({ job, transfer: { transferred: false, reason: "Payment transfers are disabled" } });
+    }
+    const transfer = await releaseProviderTransfer(job.id);
+    res.json({ job, transfer });
+  } catch (err) { next(err); }
+});
+
 app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (req, res) => {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) return res.status(503).send("Stripe webhook not configured");
   const signature = req.headers["stripe-signature"];
@@ -250,22 +474,94 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
   try {
     event = stripe.webhooks.constructEvent(req.body, signature, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    return res.status(400).send("Webhook signature verification failed");
   }
+
   try {
+    const { data: priorEvent, error: eventLookupError } = await supabase.from("stripe_webhook_events")
+      .select("processing_status").eq("id", event.id).maybeSingle();
+    if (eventLookupError) throw eventLookupError;
+    if (priorEvent?.processing_status === "processed") return res.json({ received: true, duplicate: true });
+
+    if (!priorEvent) {
+      const { error: eventInsertError } = await supabase.from("stripe_webhook_events").insert({
+        id: event.id, event_type: event.type, processing_status: "processing"
+      });
+      if (eventInsertError && eventInsertError.code !== "23505") throw eventInsertError;
+    } else {
+      const { error: retryError } = await supabase.from("stripe_webhook_events").update({
+        processing_status: "processing", last_error: null
+      }).eq("id", event.id);
+      if (retryError) throw retryError;
+    }
+
     if (event.type === "payment_intent.succeeded") {
       const intent = event.data.object;
-      if (intent.id) {
-        await supabase.from("payments").update({ status: "succeeded", stripe_payment_intent_id: intent.id }).eq("stripe_payment_intent_id", intent.id);
-      }
+      const chargeId = typeof intent.latest_charge === "string" ? intent.latest_charge : intent.latest_charge?.id;
+      const { error } = await supabase.from("payments").update({
+        status: "succeeded",
+        stripe_charge_id: chargeId || null,
+        stripe_payment_intent_id: intent.id,
+        updated_at: new Date().toISOString()
+      }).eq("stripe_payment_intent_id", intent.id);
+      if (error) throw error;
     } else if (event.type === "payment_intent.payment_failed") {
       const intent = event.data.object;
-      if (intent.id) {
-        await supabase.from("payments").update({ status: "failed", stripe_payment_intent_id: intent.id }).eq("stripe_payment_intent_id", intent.id);
+      const { error } = await supabase.from("payments").update({
+        status: "failed", updated_at: new Date().toISOString()
+      }).eq("stripe_payment_intent_id", intent.id).eq("status", "pending");
+      if (error) throw error;
+    } else if (event.type === "charge.refunded") {
+      const charge = event.data.object;
+      const { data: payment, error } = await supabase.from("payments").select("*")
+        .eq("stripe_charge_id", charge.id).maybeSingle();
+      if (error) throw error;
+      if (payment) {
+        const refunded = Number(charge.amount_refunded || 0);
+        const charged = Number(charge.amount || 0);
+        const targetReversed = charged > 0
+          ? Math.round(moneyToCents(payment.provider_amount) * refunded / charged)
+          : 0;
+        if (payment.stripe_transfer_id && targetReversed > 0) {
+          await reverseProviderTransfer(payment, targetReversed, `handygo:refund:${event.id}:transfer-reversal`);
+        }
+        const { error: updateError } = await supabase.from("payments").update({
+          status: charge.refunded ? "refunded" : "partially_refunded",
+          refunded_amount: centsToMoney(refunded),
+          updated_at: new Date().toISOString()
+        }).eq("id", payment.id);
+        if (updateError) throw updateError;
+      }
+    } else if (event.type === "charge.dispute.created") {
+      const dispute = event.data.object;
+      const chargeId = typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id;
+      const { data: payment, error } = await supabase.from("payments").select("*")
+        .eq("stripe_charge_id", chargeId).maybeSingle();
+      if (error) throw error;
+      if (payment) {
+        if (payment.stripe_transfer_id) {
+          await reverseProviderTransfer(payment, moneyToCents(payment.provider_amount), `handygo:dispute:${event.id}:transfer-reversal`);
+        }
+        const { error: updateError } = await supabase.from("payments").update({
+          status: "disputed",
+          disputed_amount: centsToMoney(Number(dispute.amount || 0)),
+          updated_at: new Date().toISOString()
+        }).eq("id", payment.id);
+        if (updateError) throw updateError;
       }
     }
+
+    const { error: markProcessedError } = await supabase.from("stripe_webhook_events").update({
+      processing_status: "processed", processed_at: new Date().toISOString(), last_error: null
+    }).eq("id", event.id);
+    if (markProcessedError) throw markProcessedError;
     res.json({ received: true });
   } catch (err) {
+    try {
+      await supabase.from("stripe_webhook_events").update({
+        processing_status: "failed", last_error: String(err.message || "processing error").slice(0, 500)
+      }).eq("id", event.id);
+    } catch (_) {}
     res.status(500).json({ error: "Webhook processing failed" });
   }
 });
