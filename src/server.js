@@ -349,15 +349,18 @@ app.post("/payments/create-intent", auth, async (req, res, next) => {
     if (providerCents <= 0) return res.status(400).json({ error: "Quote is too small for the configured platform fee" });
 
     const { data: existing, error: existingError } = await supabase.from("payments").select("*")
-      .eq("job_id", job_id).in("status", ["pending", "authorized", "succeeded", "partially_refunded", "disputed"])
-      .maybeSingle();
+      .eq("job_id", job_id).order("created_at", { ascending: false }).limit(1).maybeSingle();
     if (existingError) return next(existingError);
     if (existing?.stripe_payment_intent_id) {
       const existingIntent = await stripe.paymentIntents.retrieve(existing.stripe_payment_intent_id);
       if (existingIntent.status === "succeeded") {
         return res.status(409).json({ error: "This job has already been paid" });
       }
+      if (existingIntent.status === "canceled") {
+        return res.status(409).json({ error: "The payment attempt was canceled; contact support before trying again" });
+      }
       return res.json({
+        payment_id: existing.id,
         payment_intent_id: existingIntent.id,
         client_secret: existingIntent.client_secret,
         amount: existing.amount,
@@ -446,7 +449,7 @@ app.post("/reports", auth, async (req, res, next) => {
 app.post("/jobs/:id/complete", auth, async (req, res, next) => {
   try {
     const { data: payment, error: paymentError } = await supabase.from("payments").select("id,status")
-      .eq("job_id", req.params.id).maybeSingle();
+      .eq("job_id", req.params.id).eq("status", "succeeded").maybeSingle();
     if (paymentError) return next(paymentError);
     if (!payment || payment.status !== "succeeded") {
       return res.status(409).json({ error: "A successful customer payment is required before completion confirmation" });
@@ -534,16 +537,18 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
         }).eq("id", payment.id);
         if (updateError) throw updateError;
       }
-    } else if (event.type === "charge.dispute.created") {
+    } else if (["charge.dispute.created", "charge.dispute.updated", "charge.dispute.closed"].includes(event.type)) {
       const dispute = event.data.object;
       const chargeId = typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id;
       const { data: payment, error } = await supabase.from("payments").select("*")
         .eq("stripe_charge_id", chargeId).maybeSingle();
       if (error) throw error;
       if (payment) {
-        if (payment.stripe_transfer_id) {
+        if (event.type === "charge.dispute.created" && payment.stripe_transfer_id) {
           await reverseProviderTransfer(payment, moneyToCents(payment.provider_amount), `handygo:dispute:${event.id}:transfer-reversal`);
         }
+        // Keep the payment in a review state even after the dispute closes. A win/loss
+        // requires human reconciliation before any further provider transfer.
         const { error: updateError } = await supabase.from("payments").update({
           status: "disputed",
           disputed_amount: centsToMoney(Number(dispute.amount || 0)),
