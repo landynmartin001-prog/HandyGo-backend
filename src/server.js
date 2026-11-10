@@ -16,8 +16,12 @@ const supabase = createClient(
 );
 
 const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { maxNetworkRetries: 2 })
   : null;
+
+const CONNECT_RETURN_URL = process.env.CONNECT_RETURN_URL || "";
+const CONNECT_REFRESH_URL = process.env.CONNECT_REFRESH_URL || "";
+const CONNECT_PLATFORM_FEE_PERCENT = 0.12;
 
 app.set("trust proxy", 1);
 app.use(helmet());
@@ -32,6 +36,34 @@ function requireConfig() {
     if (!process.env[key]) missing.push(key);
   }
   return missing;
+}
+
+function requireStripe(res) {
+  if (!stripe) {
+    res.status(503).json({ error: "Stripe is not configured" });
+    return false;
+  }
+  return true;
+}
+
+function stripeTransferCapabilityActive(account) {
+  return account?.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers?.status === "active";
+}
+
+function amountToMinorUnits(amount) {
+  const value = Number(amount);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const minor = Math.round(value * 100);
+  return minor > 0 ? minor : null;
+}
+
+async function getHandymanProfile(userId) {
+  const { data, error } = await supabase.from("handyman_profiles")
+    .select("user_id,business_name,country_code,stripe_connected_account_id,stripe_onboarding_complete")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
 }
 
 async function auth(req, res, next) {
@@ -210,14 +242,191 @@ app.post("/quotes/:id/accept", auth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-app.post("/payments/create-intent", auth, (_req, res) => {
-  // Fail closed until server-verified job pricing and delayed Connect transfers are implemented.
-  res.status(503).json({ error: "Payments are temporarily disabled pending completion of the delayed-transfer payment flow." });
+app.post("/payments/create-intent", auth, async (req, res, next) => {
+  try {
+    if (!requireStripe(res)) return;
+
+    const { job_id, quote_id } = req.body || {};
+    if (!job_id || !quote_id) {
+      return res.status(400).json({ error: "job_id and quote_id are required" });
+    }
+
+    const [{ data: job, error: jobError }, { data: quote, error: quoteError }] = await Promise.all([
+      supabase.from("jobs").select("id,customer_id,status,currency_code").eq("id", job_id).maybeSingle(),
+      supabase.from("quotes").select("id,job_id,handyman_id,amount,currency_code,status").eq("id", quote_id).maybeSingle()
+    ]);
+    if (jobError) return next(jobError);
+    if (quoteError) return next(quoteError);
+    if (!job || !quote) return res.status(404).json({ error: "Job or quote not found" });
+    if (job.customer_id !== req.user.id) return res.status(403).json({ error: "Only the customer can pay for this job" });
+    if (quote.job_id !== job.id || quote.status !== "accepted" || job.status !== "booked") {
+      return res.status(409).json({ error: "The accepted quote is not payable" });
+    }
+
+    const amount = amountToMinorUnits(quote.amount);
+    if (!amount) return res.status(400).json({ error: "Invalid quote amount" });
+
+    const profile = await getHandymanProfile(quote.handyman_id);
+    if (!profile?.stripe_connected_account_id) {
+      return res.status(409).json({ error: "The handyman has not completed Stripe onboarding" });
+    }
+
+    const connectedAccount = await stripe.v2.core.accounts.retrieve(profile.stripe_connected_account_id, {
+      include: ["configuration.recipient"]
+    });
+    if (!stripeTransferCapabilityActive(connectedAccount)) {
+      return res.status(409).json({ error: "The handyman is not yet eligible to receive transfers" });
+    }
+
+    const { data: existingPayment, error: existingPaymentError } = await supabase.from("payments")
+      .select("id,stripe_payment_intent_id,status,amount,currency_code")
+      .eq("job_id", job.id)
+      .in("status", ["pending", "authorized", "succeeded"])
+      .maybeSingle();
+    if (existingPaymentError) return next(existingPaymentError);
+    if (existingPayment?.stripe_payment_intent_id) {
+      const existingIntent = await stripe.paymentIntents.retrieve(existingPayment.stripe_payment_intent_id);
+      return res.json({
+        payment: existingPayment,
+        payment_intent: existingIntent,
+        publishable_key: process.env.STRIPE_PUBLISHABLE_KEY || null
+      });
+    }
+
+    // The Stripe Platform Pricing Tool is the source of truth for the platform fee.
+    // Do not set application_fee_amount here: Stripe applies the configured pricing
+    // scheme and processing-cost protection to destination charges.
+    const intent = await stripe.paymentIntents.create({
+      amount,
+      currency: (quote.currency_code || job.currency_code || "USD").toLowerCase(),
+      transfer_data: { destination: profile.stripe_connected_account_id },
+      metadata: {
+        handygo_job_id: job.id,
+        handygo_quote_id: quote.id,
+        handygo_customer_id: req.user.id,
+        handygo_handyman_id: quote.handyman_id,
+        handygo_platform_fee_percent: String(CONNECT_PLATFORM_FEE_PERCENT)
+      },
+      description: "HandyGo job " + job.id
+    });
+
+    const { data: payment, error: paymentError } = await supabase.from("payments").insert({
+      job_id: job.id,
+      customer_id: req.user.id,
+      handyman_id: quote.handyman_id,
+      stripe_payment_intent_id: intent.id,
+      amount: Number(quote.amount),
+      currency_code: (quote.currency_code || job.currency_code || "USD").toUpperCase(),
+      platform_fee: 0,
+      provider_amount: Number(quote.amount),
+      status: "pending"
+    }).select("*").single();
+    if (paymentError) {
+      try { await stripe.paymentIntents.cancel(intent.id); } catch (_) {}
+      return next(paymentError);
+    }
+
+    res.status(201).json({
+      payment,
+      payment_intent: intent,
+      publishable_key: process.env.STRIPE_PUBLISHABLE_KEY || null
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.post("/connect/onboarding", auth, (_req, res) => {
-  // Do not accept client-supplied connected-account IDs for onboarding.
-  res.status(503).json({ error: "Provider onboarding is temporarily disabled pending server-managed Stripe Connect accounts." });
+app.post("/connect/onboarding", auth, async (req, res, next) => {
+  try {
+    if (!requireStripe(res)) return;
+    if (!CONNECT_RETURN_URL || !CONNECT_REFRESH_URL) {
+      return res.status(503).json({ error: "Connect onboarding URLs are not configured" });
+    }
+
+    const profile = await getHandymanProfile(req.user.id);
+    if (!profile) return res.status(403).json({ error: "A handyman profile is required for Stripe onboarding" });
+
+    let accountId = profile.stripe_connected_account_id;
+    if (!accountId) {
+      const account = await stripe.v2.core.accounts.create({
+        contact_email: req.user.email || undefined,
+        display_name: profile.business_name || req.user.email || "HandyGo Handyman",
+        dashboard: "express",
+        identity: {
+          country: (profile.country_code || "US").toLowerCase(),
+          entity_type: (req.body?.entity_type === "company" ? "company" : "individual")
+        },
+        configuration: {
+          recipient: {
+            capabilities: {
+              stripe_balance: { stripe_transfers: { requested: true } }
+            }
+          }
+        },
+        defaults: {
+          currency: "usd",
+          responsibilities: {
+            fees_collector: "application",
+            losses_collector: "application"
+          }
+        }
+      });
+      accountId = account.id;
+
+      const { error: saveError } = await supabase.from("handyman_profiles")
+        .update({ stripe_connected_account_id: accountId, stripe_onboarding_complete: false })
+        .eq("user_id", req.user.id);
+      if (saveError) return next(saveError);
+    }
+
+    const accountLink = await stripe.v2.core.accountLinks.create({
+      account: accountId,
+      use_case: {
+        type: "account_onboarding",
+        account_onboarding: {
+          configurations: ["recipient"],
+          refresh_url: CONNECT_REFRESH_URL,
+          return_url: CONNECT_RETURN_URL
+        }
+      }
+    });
+
+    res.json({ account_id: accountId, onboarding_url: accountLink.url });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get("/connect/status", auth, async (req, res, next) => {
+  try {
+    if (!requireStripe(res)) return;
+    const profile = await getHandymanProfile(req.user.id);
+    if (!profile?.stripe_connected_account_id) {
+      return res.json({ connected: false, transfers_active: false, onboarding_complete: false });
+    }
+
+    const account = await stripe.v2.core.accounts.retrieve(profile.stripe_connected_account_id, {
+      include: ["configuration.recipient", "requirements"]
+    });
+    const transfersActive = stripeTransferCapabilityActive(account);
+    const onboardingComplete = transfersActive && (account.requirements?.currently_due?.length || 0) === 0;
+
+    if (onboardingComplete !== Boolean(profile.stripe_onboarding_complete)) {
+      await supabase.from("handyman_profiles")
+        .update({ stripe_onboarding_complete: onboardingComplete })
+        .eq("user_id", req.user.id);
+    }
+
+    res.json({
+      connected: true,
+      account_id: profile.stripe_connected_account_id,
+      transfers_active: transfersActive,
+      onboarding_complete: onboardingComplete,
+      currently_due: account.requirements?.currently_due || []
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 app.post("/notifications/register-token", auth, async (req, res, next) => {
@@ -256,12 +465,40 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
     if (event.type === "payment_intent.succeeded") {
       const intent = event.data.object;
       if (intent.id) {
-        await supabase.from("payments").update({ status: "succeeded", stripe_payment_intent_id: intent.id }).eq("stripe_payment_intent_id", intent.id);
+        const paymentUpdate = { status: "succeeded", stripe_payment_intent_id: intent.id };
+        if (intent.latest_charge) paymentUpdate.stripe_charge_id = intent.latest_charge;
+        await supabase.from("payments").update(paymentUpdate).eq("stripe_payment_intent_id", intent.id);
       }
     } else if (event.type === "payment_intent.payment_failed") {
       const intent = event.data.object;
       if (intent.id) {
         await supabase.from("payments").update({ status: "failed", stripe_payment_intent_id: intent.id }).eq("stripe_payment_intent_id", intent.id);
+      }
+    } else if (event.type === "payment_intent.canceled") {
+      const intent = event.data.object;
+      if (intent.id) {
+        await supabase.from("payments").update({ status: "cancelled", stripe_payment_intent_id: intent.id }).eq("stripe_payment_intent_id", intent.id);
+      }
+    } else if (event.type === "charge.refunded") {
+      const charge = event.data.object;
+      if (charge.payment_intent) {
+        await supabase.from("payments").update({
+          status: charge.amount_refunded >= charge.amount ? "refunded" : "partially_refunded",
+          stripe_charge_id: charge.id
+        }).eq("stripe_payment_intent_id", charge.payment_intent);
+      }
+    } else if (event.type === "charge.dispute.created") {
+      const dispute = event.data.object;
+      if (dispute.payment_intent) {
+        await supabase.from("payments").update({ status: "disputed" }).eq("stripe_payment_intent_id", dispute.payment_intent);
+      }
+    } else if (event.type === "account.updated") {
+      const account = event.data.object;
+      const transfersActive = stripeTransferCapabilityActive(account);
+      if (account.id) {
+        await supabase.from("handyman_profiles")
+          .update({ stripe_onboarding_complete: transfersActive })
+          .eq("stripe_connected_account_id", account.id);
       }
     }
     res.json({ received: true });
