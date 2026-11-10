@@ -76,7 +76,9 @@ async function releaseProviderTransfer(jobId) {
   if (!accountId) return { transferred: false, reason: "Provider has not completed Stripe onboarding" };
 
   // Accounts v2 capability state is checked immediately before every transfer.
-  const account = await stripe.v2.core.accounts.retrieve(accountId);
+  const account = await stripe.v2.core.accounts.retrieve(accountId, {
+    include: ["configuration.recipient"]
+  });
   const transferCapabilityStatus =
     account?.configuration?.recipient?.capabilities?.stripe_balance?.stripe_transfers?.status;
   if (transferCapabilityStatus !== "active") {
