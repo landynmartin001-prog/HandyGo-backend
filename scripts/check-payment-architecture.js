@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const assert = require("node:assert/strict");
 
 const server = fs.readFileSync("src/server.js", "utf8");
+const logic = fs.readFileSync("src/payment-logic.js", "utf8");
 const migration = fs.readFileSync(
   "supabase/migrations/202611100001_delayed_provider_transfers.sql",
   "utf8"
@@ -25,3 +26,9 @@ assert.match(migration, /stripe_webhook_events/);
 assert.match(migration, /payments_stripe_transfer_id_unique/);
 
 console.log("Payment architecture safety checks passed.");
+
+assert.match(logic, /function isTestPaymentsEnabled/);
+assert.match(logic, /function refundReversalTargetCents/);
+assert.match(logic, /function reversalDeltaCents/);
+assert.match(logic, /function reconcilePayment/);
+assert.match(server, /refundReversalTargetCents\(/, "refund webhook must use tested reversal allocation logic");
