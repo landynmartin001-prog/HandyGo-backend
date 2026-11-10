@@ -10,11 +10,14 @@ const app = express();
 const PORT = Number(process.env.PORT || 10000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { autoRefreshToken: false, persistSession: false } }
-);
+const supabaseConfigured = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+const supabase = supabaseConfigured
+  ? createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY,
+      { auth: { autoRefreshToken: false, persistSession: false } }
+    )
+  : null;
 
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
@@ -140,6 +143,7 @@ function requireConfig() {
 }
 
 async function auth(req, res, next) {
+  if (!supabase) return res.status(503).json({ error: "Supabase is not configured" });
   try {
     const header = req.headers.authorization || "";
     if (!header.startsWith("Bearer ")) return res.status(401).json({ error: "Missing bearer token" });
@@ -155,7 +159,8 @@ async function auth(req, res, next) {
 
 app.get("/health", async (_req, res) => {
   const missing = requireConfig();
-  res.status(missing.length ? 503 : 200).json({
+  // Liveness checks should confirm the process is reachable; configuration is reported separately.
+  res.status(200).json({
     ok: missing.length === 0,
     service: "handygo-backend",
     environment: process.env.NODE_ENV || "development",
