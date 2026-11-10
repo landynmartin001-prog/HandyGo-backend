@@ -67,11 +67,20 @@ The current `handyman_profiles.stripe_connected_account_id` and `stripe_onboardi
 - Do not use `application_fee_amount` with this charge pattern.
 - Do not enable live charges, connected-account onboarding, or transfers until the platform's authorized adult/business representative has completed Stripe's required business and identity verification and the complete test suite passes.
 
-## Current verified implementation gap
+## Implementation status on the feature branch
 
-The currently inspected backend deliberately returns HTTP 503 from `POST /payments/create-intent` and `POST /connect/onboarding`. Its Stripe webhook only updates basic PaymentIntent success/failure statuses. It does not yet implement the delayed transfer lifecycle, transfer persistence, refund/dispute recovery, or complete account capability tracking.
+The feature branch now contains an initial **test-gated** implementation:
+- PaymentIntent creation uses the accepted server-side quote and does not set destination transfer parameters.
+- The platform fee and provider share are calculated server-side using the current 12% product setting.
+- Payment creation is disabled unless `STRIPE_PAYMENTS_ENABLED=true` and the configured Stripe key is test-mode (`sk_test_` or `rk_test_`). Live keys are rejected by this feature gate.
+- Customer and provider must each confirm completion through a server-side RPC before a provider transfer is attempted.
+- Transfers use a stable idempotency key, the originating charge, a transfer group, and a fresh Accounts v2 recipient capability check.
+- Webhook signature verification, event de-duplication, payment success/failure updates, refund transfer reversals, and dispute transfer reversals are implemented as an initial baseline.
+- Connected-account creation/onboarding remains disabled.
 
-The current backend package uses Stripe Node SDK `^18.5.0`; confirm and pin a compatible SDK/API version for Accounts v2 before implementing account creation and capability retrieval. Never substitute legacy `charges_enabled` or `payouts_enabled` checks for the v2 recipient capability check.
+This is not production-ready. The migration exists only as a repository file and has **not** been applied to the production database or any test database. Runtime tests, Stripe sandbox end-to-end tests, webhook endpoint configuration, refund API implementation, account onboarding, reconciliation, and operational alerting remain outstanding.
+
+The backend package was upgraded from Stripe Node SDK `^18.5.0` to `^20.2.0` because the Accounts v2 account retrieval used for recipient capability gating requires the newer SDK. Never substitute legacy `charges_enabled` or `payouts_enabled` checks for the v2 recipient capability check.
 
 ## Release gates
 
