@@ -6,7 +6,7 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "check": "node --check src/server.js"
+    "check": "node --check src/server.js && node scripts/check-payment-architecture.js"
   },
   "engines": {
     "node": ">=22"
