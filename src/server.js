@@ -23,6 +23,8 @@ app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors({ origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN.split(",").map(s => s.trim()) }));
 app.use(rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false }));
+// Parse JSON for API routes, but leave Stripe webhook bodies untouched for signature verification.
+app.use(express.json({ limit: "2mb", type: req => req.path !== "/webhooks/stripe" && req.is("application/json") }));
 
 function requireConfig() {
   const missing = [];
@@ -223,7 +225,6 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
   }
 });
 
-app.use(express.json({ limit: "2mb" }));
 app.use((err, _req, res, _next) => {
   console.error(err);
   res.status(500).json({ error: "Internal server error" });
