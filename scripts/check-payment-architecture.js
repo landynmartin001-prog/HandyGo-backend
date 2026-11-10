@@ -8,7 +8,7 @@ const migration = fs.readFileSync(
 );
 
 assert.match(server, /STRIPE_PAYMENTS_ENABLED === "true"/, "payments must require an explicit feature flag");
-assert.match(server, /\^\(sk\|rk\)_test_/, "payments must reject live Stripe keys");
+assert.match(server, /^(sk|rk)_test_/, "payments must reject live Stripe keys");
 assert.match(server, /stripe\.v2\.core\.accounts\.retrieve\(accountId,\s*\{\s*include:\s*\["configuration\.recipient"\]/,
   "transfers must retrieve Accounts v2 recipient configuration");
 assert.match(server, /stripe_transfers\?\.status/,"transfers must check the v2 recipient transfer capability");
