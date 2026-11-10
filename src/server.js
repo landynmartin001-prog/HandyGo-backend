@@ -145,34 +145,14 @@ app.post("/quotes/:id/accept", auth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-app.post("/payments/create-intent", auth, async (req, res, next) => {
-  try {
-    if (!stripe) return res.status(503).json({ error: "Stripe is not configured" });
-    const { amount, currency = "usd", job_id, connected_account_id, platform_fee_amount } = req.body || {};
-    if (!Number.isInteger(amount) || amount <= 0) return res.status(400).json({ error: "amount must be a positive integer in minor currency units" });
-    const params = {
-      amount, currency, automatic_payment_methods: { enabled: true },
-      metadata: { job_id: job_id || "", customer_id: req.user.id }
-    };
-    if (connected_account_id) {
-      params.transfer_data = { destination: connected_account_id };
-      if (Number.isInteger(platform_fee_amount) && platform_fee_amount >= 0) params.application_fee_amount = platform_fee_amount;
-    }
-    const intent = await stripe.paymentIntents.create(params);
-    res.json({ payment_intent_id: intent.id, client_secret: intent.client_secret });
-  } catch (err) { next(err); }
+app.post("/payments/create-intent", auth, (_req, res) => {
+  // Fail closed until server-verified job pricing and delayed Connect transfers are implemented.
+  res.status(503).json({ error: "Payments are temporarily disabled pending completion of the delayed-transfer payment flow." });
 });
 
-app.post("/connect/onboarding", auth, async (req, res, next) => {
-  try {
-    if (!stripe) return res.status(503).json({ error: "Stripe is not configured" });
-    const { connected_account_id, refresh_url, return_url } = req.body || {};
-    if (!connected_account_id || !refresh_url || !return_url) return res.status(400).json({ error: "connected_account_id, refresh_url and return_url are required" });
-    const link = await stripe.accountLinks.create({
-      account: connected_account_id, type: "account_onboarding", refresh_url, return_url
-    });
-    res.json({ url: link.url });
-  } catch (err) { next(err); }
+app.post("/connect/onboarding", auth, (_req, res) => {
+  // Do not accept client-supplied connected-account IDs for onboarding.
+  res.status(503).json({ error: "Provider onboarding is temporarily disabled pending server-managed Stripe Connect accounts." });
 });
 
 app.post("/notifications/register-token", auth, async (req, res, next) => {
