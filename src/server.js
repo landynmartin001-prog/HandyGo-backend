@@ -4,7 +4,7 @@ const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const Stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
-const { moneyToCents, centsToMoney, isTestPaymentsEnabled, refundReversalTargetCents } = require("./payment-logic");
+const { moneyToCents, centsToMoney, isTestPaymentsEnabled, refundReversalTargetCents, reversalDeltaCents } = require("./payment-logic");
 
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
@@ -113,7 +113,7 @@ async function reverseProviderTransfer(payment, targetReversedCents, idempotency
   const transfer = await stripe.transfers.retrieve(payment.stripe_transfer_id);
   const alreadyReversed = Number(transfer.amount_reversed || 0);
   const target = Math.min(Number(transfer.amount), Math.max(0, targetReversedCents));
-  const delta = target - alreadyReversed;
+  const delta = reversalDeltaCents(Number(transfer.amount), alreadyReversed, target);
   if (delta <= 0) return;
   await stripe.transfers.createReversal(transfer.id, { amount: delta }, { idempotencyKey });
   const nextStatus = target >= Number(transfer.amount) ? "reversed" : "partially_reversed";
