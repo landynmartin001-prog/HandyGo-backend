@@ -385,13 +385,49 @@ app.post("/connect/onboarding", auth, async (req, res, next) => {
         type: "account_onboarding",
         account_onboarding: {
           configurations: ["recipient"],
-          refresh_url: CONNECT_REFRESH_URL,
-          return_url: CONNECT_RETURN_URL
+          refresh_url: CONNECT_REFRESH_URL + "?account_id=" + encodeURIComponent(accountId),
+          return_url: CONNECT_RETURN_URL + "?account_id=" + encodeURIComponent(accountId)
         }
       }
     });
 
     res.json({ account_id: accountId, onboarding_url: accountLink.url });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get("/connect/return", (_req, res) => {
+  res.status(200).json({ ok: true, message: "Stripe onboarding returned to HandyGo. The handyman app should refresh /connect/status." });
+});
+
+app.get("/connect/refresh", async (req, res, next) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: "Stripe is not configured" });
+    const accountId = typeof req.query.account_id === "string" ? req.query.account_id : "";
+    if (!accountId || !CONNECT_REFRESH_URL || !CONNECT_RETURN_URL) {
+      return res.status(400).json({ error: "Invalid onboarding refresh request" });
+    }
+
+    const { data: profile, error } = await supabase.from("handyman_profiles")
+      .select("user_id,stripe_connected_account_id")
+      .eq("stripe_connected_account_id", accountId)
+      .maybeSingle();
+    if (error) return next(error);
+    if (!profile) return res.status(404).json({ error: "Connected account not found" });
+
+    const accountLink = await stripe.v2.core.accountLinks.create({
+      account: accountId,
+      use_case: {
+        type: "account_onboarding",
+        account_onboarding: {
+          configurations: ["recipient"],
+          refresh_url: CONNECT_REFRESH_URL + "?account_id=" + encodeURIComponent(accountId),
+          return_url: CONNECT_RETURN_URL + "?account_id=" + encodeURIComponent(accountId)
+        }
+      }
+    });
+    res.redirect(303, accountLink.url);
   } catch (err) {
     next(err);
   }
