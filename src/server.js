@@ -77,20 +77,48 @@ app.get("/services", async (_req, res, next) => {
 
 app.get("/jobs", auth, async (req, res, next) => {
   try {
-    const { data, error } = await supabase.from("jobs").select("*").or(`customer_id.eq.${req.user.id},handyman_id.eq.${req.user.id}`).order("created_at", { ascending: false });
-    if (error) return next(error);
-    res.json({ jobs: data || [] });
+    const [{ data: customerJobs, error: customerError }, { data: providerQuotes, error: quoteError }] = await Promise.all([
+      supabase.from("jobs").select("*").eq("customer_id", req.user.id),
+      supabase.from("quotes").select("job_id").eq("handyman_id", req.user.id)
+    ]);
+    if (customerError) return next(customerError);
+    if (quoteError) return next(quoteError);
+    const quotedJobIds = [...new Set((providerQuotes || []).map(q => q.job_id))];
+    let providerJobs = [];
+    if (quotedJobIds.length) {
+      const { data, error } = await supabase.from("jobs").select("*").in("id", quotedJobIds);
+      if (error) return next(error);
+      providerJobs = data || [];
+    }
+    const jobs = [...new Map([...(customerJobs || []), ...providerJobs].map(job => [job.id, job])).values()]
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    res.json({ jobs });
   } catch (err) { next(err); }
 });
 
 app.post("/jobs", auth, async (req, res, next) => {
   try {
-    const { title, description, service_id, latitude, longitude, address, scheduled_start } = req.body || {};
-    if (!title || !description) return res.status(400).json({ error: "title and description are required" });
-    const { data, error } = await supabase.from("jobs").insert({
-      customer_id: req.user.id, title, description, service_id,
-      latitude, longitude, address, scheduled_start, status: "open"
-    }).select("*").single();
+    const { title, description, service_id, address_text, address, scheduled_start, budget_min, budget_max } = req.body || {};
+    if (typeof title !== "string" || !title.trim() || typeof description !== "string" || !description.trim()) {
+      return res.status(400).json({ error: "title and description are required" });
+    }
+    const insert = {
+      customer_id: req.user.id,
+      title: title.trim(),
+      description: description.trim(),
+      service_id: service_id || null,
+      address_text: typeof address_text === "string" ? address_text.trim() : (typeof address === "string" ? address.trim() : null),
+      scheduled_start: scheduled_start || null,
+      budget_min: budget_min == null ? null : Number(budget_min),
+      budget_max: budget_max == null ? null : Number(budget_max),
+      status: "open"
+    };
+    if ((insert.budget_min !== null && (!Number.isFinite(insert.budget_min) || insert.budget_min < 0)) ||
+        (insert.budget_max !== null && (!Number.isFinite(insert.budget_max) || insert.budget_max < 0)) ||
+        (insert.budget_min !== null && insert.budget_max !== null && insert.budget_min > insert.budget_max)) {
+      return res.status(400).json({ error: "Invalid budget range" });
+    }
+    const { data, error } = await supabase.from("jobs").insert(insert).select("*").single();
     if (error) return next(error);
     res.status(201).json({ job: data });
   } catch (err) { next(err); }
@@ -98,30 +126,58 @@ app.post("/jobs", auth, async (req, res, next) => {
 
 app.get("/jobs/:id", auth, async (req, res, next) => {
   try {
-    const { data, error } = await supabase.from("jobs").select("*").eq("id", req.params.id).single();
+    const { data: job, error } = await supabase.from("jobs").select("*").eq("id", req.params.id).maybeSingle();
     if (error) return next(error);
-    if (data.customer_id !== req.user.id && data.handyman_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
-    res.json({ job: data });
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    if (job.customer_id !== req.user.id) {
+      const { data: quote, error: quoteError } = await supabase.from("quotes").select("id")
+        .eq("job_id", job.id).eq("handyman_id", req.user.id).limit(1).maybeSingle();
+      if (quoteError) return next(quoteError);
+      if (!quote) return res.status(403).json({ error: "Forbidden" });
+    }
+    res.json({ job });
   } catch (err) { next(err); }
 });
 
 app.get("/jobs/:id/quotes", auth, async (req, res, next) => {
   try {
-    const { data: job, error: jobError } = await supabase.from("jobs").select("*").eq("id", req.params.id).single();
+    const { data: job, error: jobError } = await supabase.from("jobs").select("*").eq("id", req.params.id).maybeSingle();
     if (jobError) return next(jobError);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    if (job.customer_id !== req.user.id) {
+      const { data: ownQuote, error: ownQuoteError } = await supabase.from("quotes").select("id")
+        .eq("job_id", job.id).eq("handyman_id", req.user.id).limit(1).maybeSingle();
+      if (ownQuoteError) return next(ownQuoteError);
+      if (!ownQuote) return res.status(403).json({ error: "Forbidden" });
+    }
     const { data, error } = await supabase.from("quotes").select("*").eq("job_id", req.params.id).order("created_at");
     if (error) return next(error);
-    if (job.customer_id !== req.user.id && job.handyman_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
     res.json({ quotes: data || [] });
   } catch (err) { next(err); }
 });
 
 app.post("/jobs/:id/quotes", auth, async (req, res, next) => {
   try {
-    const { amount, message, estimated_duration_minutes } = req.body || {};
-    if (amount == null) return res.status(400).json({ error: "amount is required" });
+    const amount = Number((req.body || {}).amount);
+    const { message, estimated_duration_minutes } = req.body || {};
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "A positive quote amount is required" });
+    if (estimated_duration_minutes != null && (!Number.isInteger(Number(estimated_duration_minutes)) || Number(estimated_duration_minutes) <= 0)) {
+      return res.status(400).json({ error: "estimated_duration_minutes must be a positive integer" });
+    }
+    const { data: job, error: jobError } = await supabase.from("jobs").select("id,status").eq("id", req.params.id).maybeSingle();
+    if (jobError) return next(jobError);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    if (!["open", "quoted"].includes(job.status)) return res.status(409).json({ error: "This job is not accepting quotes" });
+    const { data: profile, error: profileError } = await supabase.from("handyman_profiles")
+      .select("user_id,verification_status").eq("user_id", req.user.id).maybeSingle();
+    if (profileError) return next(profileError);
+    if (!profile) return res.status(403).json({ error: "A handyman profile is required to submit a quote" });
+    if (profile.verification_status !== "verified") return res.status(403).json({ error: "Handyman verification is required before quoting" });
     const { data, error } = await supabase.from("quotes").insert({
-      job_id: req.params.id, handyman_id: req.user.id, amount, message, estimated_duration_minutes, status: "pending"
+      job_id: req.params.id, handyman_id: req.user.id, amount,
+      message: typeof message === "string" ? message : null,
+      estimated_duration_minutes: estimated_duration_minutes == null ? null : Number(estimated_duration_minutes),
+      status: "pending"
     }).select("*").single();
     if (error) return next(error);
     res.status(201).json({ quote: data });
@@ -130,18 +186,27 @@ app.post("/jobs/:id/quotes", auth, async (req, res, next) => {
 
 app.post("/quotes/:id/accept", auth, async (req, res, next) => {
   try {
-    const { data: quote, error: qErr } = await supabase.from("quotes").select("*").eq("id", req.params.id).single();
+    const { data: quote, error: qErr } = await supabase.from("quotes").select("*").eq("id", req.params.id).maybeSingle();
     if (qErr) return next(qErr);
-    const { data: job, error: jErr } = await supabase.from("jobs").select("*").eq("id", quote.job_id).single();
+    if (!quote) return res.status(404).json({ error: "Quote not found" });
+    const { data: job, error: jErr } = await supabase.from("jobs").select("*").eq("id", quote.job_id).maybeSingle();
     if (jErr) return next(jErr);
+    if (!job) return res.status(404).json({ error: "Job not found" });
     if (job.customer_id !== req.user.id) return res.status(403).json({ error: "Only the customer can accept a quote" });
-    const { data, error } = await supabase.from("jobs").update({
-      handyman_id: quote.handyman_id, accepted_quote_id: quote.id, status: "accepted"
-    }).eq("id", job.id).select("*").single();
-    if (error) return next(error);
-    await supabase.from("quotes").update({ status: "rejected" }).eq("job_id", job.id).neq("id", quote.id);
-    await supabase.from("quotes").update({ status: "accepted" }).eq("id", quote.id);
-    res.json({ job: data });
+    if (quote.status !== "pending" || !["open", "quoted"].includes(job.status)) {
+      return res.status(409).json({ error: "This quote can no longer be accepted" });
+    }
+    const { data: updatedJob, error: jobUpdateError } = await supabase.from("jobs")
+      .update({ status: "booked" }).eq("id", job.id).in("status", ["open", "quoted"]).select("*").maybeSingle();
+    if (jobUpdateError) return next(jobUpdateError);
+    if (!updatedJob) return res.status(409).json({ error: "The job was changed by another request; refresh and try again" });
+    const { error: acceptError } = await supabase.from("quotes").update({ status: "accepted" })
+      .eq("id", quote.id).eq("status", "pending");
+    if (acceptError) return next(acceptError);
+    const { error: declineError } = await supabase.from("quotes").update({ status: "declined" })
+      .eq("job_id", job.id).neq("id", quote.id).eq("status", "pending");
+    if (declineError) return next(declineError);
+    res.json({ job: updatedJob, accepted_quote_id: quote.id, handyman_id: quote.handyman_id });
   } catch (err) { next(err); }
 });
 
