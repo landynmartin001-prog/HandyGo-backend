@@ -157,6 +157,47 @@ async function auth(req, res, next) {
   }
 }
 
+app.get("/health/dependencies", async (_req, res) => {
+  if (process.env.NODE_ENV === "production") {
+    return res.status(404).json({ error: "Not available in production" });
+  }
+
+  const result = {
+    ok: true,
+    supabase: { configured: Boolean(supabase), reachable: false },
+    stripe: { configured: Boolean(stripe), reachable: false, test_mode: null }
+  };
+
+  if (supabase) {
+    try {
+      // Service-role auth call verifies the configured Supabase URL/key without reading app tables.
+      await supabase.auth.admin.listUsers({ page: 1, perPage: 1 });
+      result.supabase.reachable = true;
+    } catch (err) {
+      result.ok = false;
+      console.error("Supabase dependency check failed:", err?.message || err);
+    }
+  } else {
+    result.ok = false;
+  }
+
+  if (stripe) {
+    try {
+      const balance = await stripe.balance.retrieve();
+      result.stripe.reachable = true;
+      result.stripe.test_mode = balance.livemode === false;
+      if (balance.livemode !== false) result.ok = false;
+    } catch (err) {
+      result.ok = false;
+      console.error("Stripe dependency check failed:", err?.message || err);
+    }
+  } else {
+    result.ok = false;
+  }
+
+  res.status(result.ok ? 200 : 503).json(result);
+});
+
 app.get("/health", async (_req, res) => {
   const missing = requireConfig();
   // Liveness checks should confirm the process is reachable; configuration is reported separately.
