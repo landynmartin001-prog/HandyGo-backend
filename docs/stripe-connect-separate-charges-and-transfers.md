@@ -78,7 +78,7 @@ The feature branch now contains an initial **test-gated** implementation:
 - Webhook signature verification, event de-duplication, payment success/failure updates, refund transfer reversals, and dispute transfer reversals are implemented as an initial baseline.
 - Connected-account creation/onboarding remains disabled.
 
-This is not production-ready. The migration exists only as a repository file and has **not** been applied to the production database or any test database. Runtime tests, Stripe sandbox end-to-end tests, webhook endpoint configuration, refund API implementation, account onboarding, reconciliation, and operational alerting remain outstanding.
+This is not production-ready. The migration exists only as a repository file and has **not** been applied to the production database or any test database. Node unit tests now cover cent conversion, test-key gating, the 12% split, cumulative partial/full refund reversal math, idempotent reversal deltas, and a pure reconciliation comparison helper. These tests do not call Stripe or Supabase. Stripe sandbox end-to-end tests, webhook endpoint configuration, a customer refund API, connected-account onboarding, a scheduled/live reconciliation worker, and operational alerting remain outstanding.
 
 The backend package was upgraded from Stripe Node SDK `^18.5.0` to `^20.2.0` because the Accounts v2 account retrieval used for recipient capability gating requires the newer SDK. Never substitute legacy `charges_enabled` or `payouts_enabled` checks for the v2 recipient capability check.
 
