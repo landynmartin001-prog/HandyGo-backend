@@ -4,6 +4,7 @@ const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const Stripe = require("stripe");
 const { createClient } = require("@supabase/supabase-js");
+const { moneyToCents, centsToMoney, isTestPaymentsEnabled, refundReversalTargetCents } = require("./payment-logic");
 
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
@@ -20,18 +21,7 @@ const stripe = process.env.STRIPE_SECRET_KEY
   : null;
 
 const PLATFORM_FEE_BPS = 1200; // 12% of the accepted quote, in basis points.
-const TEST_PAYMENTS_ONLY = process.env.STRIPE_PAYMENTS_ENABLED === "true" &&
-  Boolean(process.env.STRIPE_SECRET_KEY && /^(sk|rk)_test_/.test(process.env.STRIPE_SECRET_KEY));
-
-function moneyToCents(value) {
-  const amount = Number(value);
-  if (!Number.isFinite(amount) || amount <= 0) throw new Error("Invalid payment amount");
-  return Math.round((amount + Number.EPSILON) * 100);
-}
-
-function centsToMoney(value) {
-  return (Number(value) / 100).toFixed(2);
-}
+const TEST_PAYMENTS_ONLY = isTestPaymentsEnabled(process.env.STRIPE_PAYMENTS_ENABLED, process.env.STRIPE_SECRET_KEY);
 
 function paymentFeatureUnavailable(res) {
   return res.status(503).json({
@@ -524,9 +514,9 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
       if (payment) {
         const refunded = Number(charge.amount_refunded || 0);
         const charged = Number(charge.amount || 0);
-        const targetReversed = charged > 0
-          ? Math.round(moneyToCents(payment.provider_amount) * refunded / charged)
-          : 0;
+        const targetReversed = refundReversalTargetCents(
+          moneyToCents(payment.provider_amount), refunded, charged
+        );
         if (payment.stripe_transfer_id && targetReversed > 0) {
           await reverseProviderTransfer(payment, targetReversed, `handygo:refund:${event.id}:transfer-reversal`);
         }
