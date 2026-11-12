@@ -344,6 +344,33 @@ app.post("/connect/onboarding", auth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+app.post("/businesses", auth, async (req, res, next) => {
+  try {
+    const { name, services, service_area, description } = req.body || {};
+    if (typeof name !== "string" || !name.trim()) return res.status(400).json({ error: "Business name is required" });
+    const serviceList = Array.isArray(services) ? services.filter(x => typeof x === "string" && x.trim()).map(x => x.trim()) : [];
+    if (!serviceList.length) return res.status(400).json({ error: "At least one service is required" });
+    const { data, error } = await supabase.from("businesses").insert({
+      owner_id: req.user.id,
+      name: name.trim(),
+      services: serviceList,
+      service_area: typeof service_area === "string" ? service_area.trim() : null,
+      description: typeof description === "string" ? description.trim() : null,
+      status: "pending"
+    }).select("*").single();
+    if (error) return next(error);
+    res.status(201).json({ business: data });
+  } catch (err) { next(err); }
+});
+
+app.get("/businesses/mine", auth, async (req, res, next) => {
+  try {
+    const { data, error } = await supabase.from("businesses").select("*").eq("owner_id", req.user.id).order("created_at", { ascending: false });
+    if (error) return next(error);
+    res.json({ businesses: data || [] });
+  } catch (err) { next(err); }
+});
+
 app.post("/notifications/register-token", auth, async (req, res, next) => {
   try {
     const { token, platform } = req.body || {};
