@@ -12,7 +12,15 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { autoRefreshToken: false, persistSession: false } }
+  { auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false } }
+);
+
+// Use the public project key only to validate incoming user JWTs.
+// Keep the secret/service-role client separate for privileged database work.
+const supabaseAuth = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_PUBLISHABLE_KEY,
+  { auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false } }
 );
 
 const stripe = process.env.STRIPE_SECRET_KEY
@@ -23,12 +31,11 @@ app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors({ origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN.split(",").map(s => s.trim()) }));
 app.use(rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false }));
-// Parse JSON for API routes, but leave Stripe webhook bodies untouched for signature verification.
 app.use(express.json({ limit: "2mb", type: req => req.path !== "/webhooks/stripe" && req.is("application/json") }));
 
 function requireConfig() {
   const missing = [];
-  for (const key of ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]) {
+  for (const key of ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_PUBLISHABLE_KEY"]) {
     if (!process.env[key]) missing.push(key);
   }
   return missing;
@@ -39,7 +46,7 @@ async function auth(req, res, next) {
     const header = req.headers.authorization || "";
     if (!header.startsWith("Bearer ")) return res.status(401).json({ error: "Missing bearer token" });
     const token = header.slice(7);
-    const { data, error } = await supabase.auth.getUser(token);
+    const { data, error } = await supabaseAuth.auth.getUser(token);
     if (error || !data.user) return res.status(401).json({ error: "Invalid authentication token" });
     req.user = data.user;
     next();
@@ -47,17 +54,6 @@ async function auth(req, res, next) {
     next(err);
   }
 }
-
-app.get("/health", async (_req, res) => {
-  const missing = requireConfig();
-  res.status(missing.length ? 503 : 200).json({
-    ok: missing.length === 0,
-    service: "handygo-backend",
-    environment: process.env.NODE_ENV || "development",
-    configured: { supabase: missing.length === 0, stripe: Boolean(process.env.STRIPE_SECRET_KEY) },
-    missing
-  });
-});
 
 app.get("/me", auth, async (req, res, next) => {
   try {
